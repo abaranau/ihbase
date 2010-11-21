@@ -20,18 +20,23 @@
 package org.apache.hadoop.hbase.regionserver;
 
 import org.apache.commons.lang.time.StopWatch;
+import org.apache.hadoop.hbase.DoNotRetryIOException;
 import org.apache.hadoop.hbase.HColumnDescriptor;
+import org.apache.hadoop.hbase.JmxHelper;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.NotServingRegionException;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.client.idx.IdxColumnDescriptor;
 import org.apache.hadoop.hbase.client.idx.IdxIndexDescriptor;
-import org.apache.hadoop.hbase.io.HeapSize;
+import org.apache.hadoop.hbase.client.idx.IdxScan;
+import org.apache.hadoop.hbase.client.idx.exp.Expression;
 import org.apache.hadoop.hbase.regionserver.idx.support.IdxClassSize;
 import org.apache.hadoop.hbase.regionserver.idx.support.arrays.ObjectArrayList;
+import org.apache.hadoop.hbase.regionserver.idx.support.sets.IntSet;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.ClassSize;
 import org.apache.hadoop.hbase.util.Pair;
+import org.apache.hadoop.metrics.util.MBeanUtil;
 import org.apache.log4j.Logger;
 
 import java.io.IOException;
@@ -47,11 +52,11 @@ import java.util.concurrent.Callable;
 /**
  * Manages the indexes for a single region.
  */
-public class IdxRegionIndexManager implements HeapSize {
+public class IdxRegionIndexManager extends IndexManager {
     private static final Logger LOG = Logger.getLogger(IdxRegionIndexManager.class);
 
     static final long FIXED_SIZE =
-            ClassSize.align(ClassSize.OBJECT + 3 * ClassSize.REFERENCE +
+            ClassSize.align(ClassSize.OBJECT + 4 * ClassSize.REFERENCE +
                     IdxClassSize.HASHMAP + IdxClassSize.OBJECT_ARRAY_LIST +
                     Bytes.SIZEOF_LONG + ClassSize.REENTRANT_LOCK);
 
@@ -61,7 +66,9 @@ public class IdxRegionIndexManager implements HeapSize {
     /**
      * The wrapping region.
      */
-    private final IdxRegion region;
+    private IdxRegion region;
+
+    private final IdxExpressionEvaluator expressionEvaluator;
 
     /**
      * The index map. Each pair holds the column and qualifier.
@@ -80,17 +87,33 @@ public class IdxRegionIndexManager implements HeapSize {
     private static final double INDEX_SIZE_GROWTH_FACTOR = 1.1;
     private static final double BYTES_IN_MB = 1024D * 1024D;
 
-    /**
+    public IdxRegionIndexManager() {
+        expressionEvaluator = new IdxExpressionEvaluator();
+    }
+
+  /**
      * Create and initialize a new index manager.
      *
      * @param region the region to connect to
      */
-    public IdxRegionIndexManager(IdxRegion region) {
+    @Override
+    public void initialize(IdxRegion region) {
         this.region = region;
         heapSize = FIXED_SIZE;
+
+        JmxHelper.registerMBean(
+                IdxRegionIndexManagerMBeanImpl.generateObjectName(region.getRegionInfo()),
+                IdxRegionIndexManagerMBeanImpl.newIdxRegionIndexManagerMBeanImpl(this));
     }
 
-    /**
+    @Override
+    public void cleanup() {
+        MBeanUtil.unregisterMBean(
+                IdxRegionMBeanImpl.generateObjectName(region.getRegionInfo()));
+
+    }
+
+  /**
      * Get the list of keys for this index manager.
      *
      * @return the list of keys
@@ -110,6 +133,7 @@ public class IdxRegionIndexManager implements HeapSize {
      * @return total time in millis to rebuild the indexes
      * @throws IOException in case scan throws
      */
+    @Override
     public Pair<Long, Callable<Void>> rebuildIndexes() throws IOException {
         long startMillis = System.currentTimeMillis();
         if (LOG.isInfoEnabled()) {
@@ -285,7 +309,7 @@ public class IdxRegionIndexManager implements HeapSize {
 
     @Override
     public long heapSize() {
-        return heapSize;
+        return heapSize + expressionEvaluator.heapSize();
     }
 
     /**
@@ -313,5 +337,32 @@ public class IdxRegionIndexManager implements HeapSize {
             }
         }
         throw new IllegalArgumentException("No index for " + columnName);
+    }
+
+    IdxRegion getRegion() {
+      return region;
+    }
+
+    @Override
+    public IndexScannerContext newIndexScannerContext(Scan scan) throws IOException {
+      // use the expression evaluator to determine the final set of ints
+      Expression expression = IdxScan.getExpression(scan);
+
+      IdxSearchContext idxSearchContext = newSearchContext();
+
+      IntSet matchedExpression;
+      try {
+          matchedExpression = expressionEvaluator.evaluate(
+                  idxSearchContext, expression
+          );
+      } catch (RuntimeException e) {
+          throw new DoNotRetryIOException(e.getMessage(), e);
+      }
+      if (LOG.isDebugEnabled()) {
+          LOG.debug(String.format("%s rows matched the index expression",
+                  matchedExpression.size()));
+      }
+
+      return new IdxScannerContext(idxSearchContext, matchedExpression);
     }
 }

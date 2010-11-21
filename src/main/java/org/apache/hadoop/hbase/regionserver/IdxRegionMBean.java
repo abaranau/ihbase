@@ -32,21 +32,6 @@ public interface IdxRegionMBean {
     boolean isValid();
 
     /**
-     * The number of keys in the index which is equivalent to the number of top
-     * level rows in this region.
-     *
-     * @return the number of keys in the index.
-     */
-    int getNumberOfIndexedKeys();
-
-    /**
-     * The total heap size, in bytes, used by the indexes and their overhead.
-     *
-     * @return the total index heap size in bytes.
-     */
-    long getIndexesTotalHeapSize();
-
-    /**
      * Gets the total number of indexed scan since the last reset.
      *
      * @return the total number of indexed scans.

@@ -21,7 +21,6 @@ package org.apache.hadoop.hbase.regionserver;
 
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.hbase.DoNotRetryIOException;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.JmxHelper;
@@ -29,7 +28,6 @@ import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.client.idx.IdxScan;
 import org.apache.hadoop.hbase.client.idx.exp.Expression;
-import org.apache.hadoop.hbase.regionserver.idx.support.sets.IntSet;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.ClassSize;
 import org.apache.hadoop.hbase.util.Pair;
@@ -61,8 +59,7 @@ public class IdxRegion extends HRegion {
             INDEX_BUILD_TIME_HISTORY_SIZE * Bytes.SIZEOF_LONG +
             Bytes.SIZEOF_INT;
 
-    private IdxRegionIndexManager indexManager;
-    private IdxExpressionEvaluator expressionEvaluator;
+    private IndexManager indexManager;
 
     // todo add a total number of ongoing scans to the HRegion
     private AtomicInteger numberOfOngoingIndexedScans;
@@ -89,8 +86,8 @@ public class IdxRegion extends HRegion {
     public IdxRegion(Path basedir, HLog log, FileSystem fs, HBaseConfiguration
             conf, HRegionInfo regionInfo, FlushRequester flushListener) {
         super(basedir, log, fs, conf, regionInfo, flushListener);
-        indexManager = new IdxRegionIndexManager(this);
-        expressionEvaluator = new IdxExpressionEvaluator();
+        indexManager = new IdxRegionIndexManager();
+        indexManager.initialize(this);
         // monitoring parameters
         numberOfOngoingIndexedScans = new AtomicInteger(0);
         totalIndexedScans = new AtomicLong(0);
@@ -146,6 +143,7 @@ public class IdxRegion extends HRegion {
     public List<StoreFile> close(boolean abort) throws IOException {
         MBeanUtil.unregisterMBean(
                 IdxRegionMBeanImpl.generateObjectName(getRegionInfo()));
+        indexManager.cleanup();
         return super.close(abort);
     }
 
@@ -178,24 +176,6 @@ public class IdxRegion extends HRegion {
             totalKVs += store.memstore.numKeyValues();
         }
         return totalKVs / this.stores.size();
-    }
-
-    /**
-     * A monitoring operation which exposes the number of indexed keys.
-     *
-     * @return the number of indexed keys.
-     */
-    public int getNumberOfIndexedKeys() {
-        return indexManager.getNumberOfKeys();
-    }
-
-    /**
-     * The total heap size consumed by all indexes.
-     *
-     * @return the index heap size.
-     */
-    public long getIndexesTotalHeapSize() {
-        return indexManager.heapSize();
     }
 
     /**
@@ -267,16 +247,6 @@ public class IdxRegion extends HRegion {
         return prevTimes;
     }
 
-    /**
-     * The size of the index on the specified column in bytes.
-     *
-     * @param columnName the column to check.
-     * @return the size fo the requesed index
-     */
-    public long getIndexHeapSize(String columnName) {
-        return indexManager.getIndexHeapSize(columnName);
-    }
-
     private IdxRegionScanner lastScanner = null;
 
     class IdxRegionScanner extends RegionScanner {
@@ -287,27 +257,13 @@ public class IdxRegion extends HRegion {
             super(scan);
             //DebugPrint.println("IdxRegionScanner.<init>");
 
-            Expression expression = IdxScan.getExpression(scan);
             totalIndexedScans.incrementAndGet();
 
-            IdxSearchContext idxSearchContext = indexManager.newSearchContext();
-
-            // use the expression evaluator to determine the final set of ints
-            IntSet matchedExpression;
-            try {
-                matchedExpression = expressionEvaluator.evaluate(
-                        idxSearchContext, expression
-                );
-            } catch (RuntimeException e) {
-                throw new DoNotRetryIOException(e.getMessage(), e);
-            }
-            if (LOG.isDebugEnabled()) {
-                LOG.debug(String.format("%s rows matched the index expression",
-                        matchedExpression.size()));
-            }
+            IndexScannerContext indexScannerContext = indexManager.newIndexScannerContext(scan);
 
             numberOfOngoingIndexedScans.incrementAndGet();
-            keyProvider = new KeyProvider(idxSearchContext, matchedExpression, scan);
+
+            keyProvider = new KeyProvider(indexScannerContext, scan);
         }
 
 
@@ -387,9 +343,7 @@ public class IdxRegion extends HRegion {
 
     class KeyProvider {
         private KeyValueHeap memstoreHeap;
-        private final IdxSearchContext indexSearchContext;
-        private final IntSet.IntSetIterator matchedExpressionIterator;
-        private Scan scan;
+        private final IndexScannerContext indexScannerContext;
 
         private KeyValue currentMemstoreKey = null;
         private KeyValue currentExpressionKey = null;
@@ -397,11 +351,8 @@ public class IdxRegion extends HRegion {
         private byte[] startRow;
         private boolean isStartRowSatisfied;
 
-        KeyProvider(IdxSearchContext idxSearchContext,
-                    IntSet matchedExpression, Scan scan) {
-            this.indexSearchContext = idxSearchContext;
-            this.matchedExpressionIterator = matchedExpression.iterator();
-            this.scan = scan;
+        KeyProvider(IndexScannerContext indexScannerContext, Scan scan) {
+            this.indexScannerContext = indexScannerContext;
 
             startRow = scan.getStartRow();
             isStartRowSatisfied = startRow == null;
@@ -487,11 +438,8 @@ public class IdxRegion extends HRegion {
         }
 
         private KeyValue nextExpressionRow() {
-            KeyValue nextExpressionKey = null;
-            while (matchedExpressionIterator.hasNext()) {
-                int index = matchedExpressionIterator.next();
-                nextExpressionKey = indexSearchContext.lookupRow(index);
-
+            KeyValue nextExpressionKey = indexScannerContext.getNextKey();
+            while (nextExpressionKey != null) {
                 // if the scan has specified a startRow we need to keep looping
                 // over the keys returned from the index until it's satisfied
                 if (!isStartRowSatisfied) {
@@ -502,6 +450,7 @@ public class IdxRegion extends HRegion {
                 } else {
                     break;
                 }
+                nextExpressionKey = indexScannerContext.getNextKey();
             }
 
             return nextExpressionKey;
@@ -529,7 +478,7 @@ public class IdxRegion extends HRegion {
          * Close this key provider - delegate close and free memory.
          */
         public void close() {
-            this.indexSearchContext.close();
+            indexScannerContext.close();
             this.memstoreHeap.close();
         }
     }
@@ -537,7 +486,7 @@ public class IdxRegion extends HRegion {
     @Override
     public long heapSize() {
         return FIXED_OVERHEAD + super.heapSize() +
-                indexManager.heapSize() + expressionEvaluator.heapSize();
+                indexManager.heapSize();
     }
 
 }
